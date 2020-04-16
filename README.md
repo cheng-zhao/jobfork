@@ -53,9 +53,9 @@ In this case only the corresponding executable is generated for each of the comp
 
 ### Job list file
 
-Before calling the jobfork executables, one has to prepare a job list file, which is a plain text file containing all the jobs to be run. Each line of the file should be one valid shell command. Lines starting with `#` (which can be reset in [jobfork.h](jobfork.h#L26)) are treated as comments, and ignored by the scheduler.
+Before calling the jobfork executables, one has to prepare a job list file, which is a plain text file containing all the jobs to be run. Each line of the file should be one valid shell command. Lines starting with `#` (which can be reset in [jobfork.h](jobfork.h#L55)) are treated as comments, and ignored by the scheduler.
 
-Note that currently the job list file must be a real file on disk, and should be passed by pipe. In addition, the number of characters for each command should not exceed 2048 (defined in [jobfork.h](jobfork.h#L25)).
+Note that currently the job list file must be a real file on disk, and should be passed by pipe. In addition, the number of characters for each command should not exceed 2048 (defined in [jobfork.h](jobfork.h#L54)).
 
 As an example, we create a job list file called `joblist.txt`, with the contents as follows:
 ```console
