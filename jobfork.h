@@ -27,8 +27,8 @@
 *
 *******************************************************************************/
 
-#ifndef __JOBFORK_H__
-#define __JOBFORK_H__
+#ifndef JOBFORK_H
+#define JOBFORK_H
 
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
@@ -41,29 +41,36 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/types.h>
+#include <time.h>
 
+/* Prefer the MPI scheduler if both modes are enabled. */
 #ifdef CMD_MPI
 #define FLUSH_STDOUT
 #undef CMD_OMP
 #endif
 
-#ifndef _PATH_BSHELL
-#define _PATH_BSHELL "/bin/sh"
+#ifndef JOBFORK_SHELL
+#define JOBFORK_SHELL "/bin/sh"
 #endif
 
-#define CMD_BUF 2048            /* maximum number of characters for commands */
+#define CMD_BUF 2048            /* maximum number of bytes for commands */
 #define COMMENT '#'             /* comment symbol for the job list file */
 #define JOB_START 1
 #define JOB_FAIL  2
 #define JOB_DONE  3
+#define PIPE_READ_MAX 16        /* maximum number of reads per call */
 
-volatile sig_atomic_t term;     /* flag for signal termination */
+#ifndef IDLE_MSEC
+#define IDLE_MSEC 10            /* idle sleep between job loop checks */
+#endif
 
-/******************************************************************************
-  Definition of error codes.
-******************************************************************************/
+extern int term;                /* handled stop signal */
+
+/*============================================================================*\
+                           Definition of error codes
+\*============================================================================*/
 #define ERR_MEMORY      101     /* failed to allocate memory      */
-#define ERR_FILE        102     /* failed to read file            */
+#define ERR_FILE        102     /* failed to read or write a file */
 #define ERR_PIPE        103     /* failed to allocate pipe        */
 #define ERR_FORK        104     /* failed to create a process     */
 #define ERR_REDIR       105     /* failed to redirect I/O         */
@@ -71,11 +78,13 @@ volatile sig_atomic_t term;     /* flag for signal termination */
 #define ERR_STRING      107     /* string length exceeding limits */
 #define ERR_ARG         108     /* invalid argument               */
 #define ERR_CMD         109     /* invalid command                */
-#define ERR_OTHER       199     /* unknown errors                 */
+#define ERR_SIG         110     /* signal handling error          */
+#define ERR_MPI         111     /* MPI error                      */
+#define ERR_OTHER       119     /* unknown errors                 */
 
-/******************************************************************************
-  Definitions for printing messages.
-******************************************************************************/
+/*============================================================================*\
+                                   Shortcuts
+\*============================================================================*/
 #define MSG_ERR(...)            \
   fprintf(stderr, "\x1B[31;1mError:\x1B[0m " __VA_ARGS__)
 #define MSG_CHILD_STDOUT(...)   \
@@ -83,38 +92,120 @@ volatile sig_atomic_t term;     /* flag for signal termination */
 #define MSG_CHILD_STDERR(...)   \
   fprintf(stderr, "\x1B[31;1m<%d-%d>\x1B[0m %s", __VA_ARGS__)
 
-/******************************************************************************
-  Definition of data types.
-******************************************************************************/
+#ifdef CMD_MPI
+#define MPI_CHECK(func) {                                       \
+  int _err = (func);                                            \
+  if (_err != MPI_SUCCESS) {                                    \
+    MSG_ERR("MPI call failed: %s (error %d).\n", #func, _err);  \
+    MPI_Abort(MPI_COMM_WORLD, _err);                            \
+    _Exit(ERR_MPI);                                             \
+  }                                                             \
+}
+#endif
+
+/*============================================================================*\
+                            Definition of data types
+\*============================================================================*/
 typedef struct {
   pid_t pid;
-  FILE *out;
-  FILE *err;
+  int fd[2];                    /* POSIX file descriptor of stdout and stderr */
+  char line[2][CMD_BUF];        /* incomplete output lines */
+  int used[2];
+  int stopped;
+  int failed;
 } CHILD_INFO;
 
 struct cmd_status {
-  char fname_rst[CMD_BUF];              /* restart file for failed jobs */
+  char fname_rst[CMD_BUF];              /* restart file for unfinished jobs */
   int num;
   int len;
   char *cmd;
   char *status;
-} cstat;
+};
+extern struct cmd_status cstat;
+
+/*============================================================================*\
+                            Definition of functions
+\*============================================================================*/
 
 /******************************************************************************
-  Definition of functions.
+Function `read_jobs`:
+  Read commands (one per non-empty line) from a job list file.
+Arguments:
+  * `fname`:    path to the job list file.
+Return:
+  Zero on success; non-zero on error.
 ******************************************************************************/
-int read_jobs(const char *);
+int read_jobs(const char *fname);
 
-void save_jobs(void);
+/******************************************************************************
+Function `save_jobs`:
+  Write unfinished commands to a restart file.
+Return:
+  Zero on success; non-zero on error.
+******************************************************************************/
+int save_jobs(void);
 
-int create_child(const char *, CHILD_INFO *);
+/******************************************************************************
+Function `create_child`:
+  Create a child process for a shell command.
+Arguments:
+  * `cmd`:      the command to be executed;
+  * `ci`:       child information.
+Return:
+  Zero on success; non-zero on error.
+******************************************************************************/
+int create_child(const char *cmd, CHILD_INFO *ci);
 
-int close_child(CHILD_INFO *);
+/******************************************************************************
+Function `close_child`:
+  Read available child output, check its status, and stop it if requested.
+Arguments:
+  * `ci`:       child information;
+  * `task`:     MPI task or OpenMP thread number;
+  * `idx`:      job index for this task or thread;
+  * `stop`:     non-zero for terminating the job.
+Return:
+  JOB_START if job is running; JOB_DONE on success; JOB_FAIL on error.
+******************************************************************************/
+int close_child(CHILD_INFO *ci, const int task, const int idx, const int stop);
 
-void terminate(int);
+/******************************************************************************
+Function `check_signal`:
+  Check if a termination signal has been received.
+Return:
+  Zero if no stop is requested; otherwise the detected signal number.
+******************************************************************************/
+int check_signal(void);
 
-void mpi_manager(const int, int *);
+/******************************************************************************
+Function `check_jobs`:
+  Check for a stop request and save the restart file if needed.
+Return:
+  Zero if no stop is requested; otherwise the stop signal number.
+******************************************************************************/
+int check_jobs(void);
 
-void mpi_worker(char *, CHILD_INFO *);
+/******************************************************************************
+Function `idle_wait`:
+  Sleep shortly to avoid busy-waiting between job loop checks.
+******************************************************************************/
+void idle_wait(void);
+
+#ifdef CMD_MPI
+/******************************************************************************
+Function `mpi_manager`:
+  Schedule commands and execute task-private jobs simultaneously.
+Arguments:
+  * `tasknum`:  total number of MPI tasks.
+******************************************************************************/
+void mpi_manager(const int tasknum);
+
+/******************************************************************************
+Function `mpi_worker`:
+  Run assigned jobs and report completion to the manager.
+******************************************************************************/
+void mpi_worker(void);
+#endif
 
 #endif

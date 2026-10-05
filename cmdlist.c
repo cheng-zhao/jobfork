@@ -1,66 +1,105 @@
 #include "jobfork.h"
 #include <ctype.h>
 #include <fcntl.h>
+#include <limits.h>
 
-#ifdef CMD_MPI
-#include <mpi.h>
-#endif
+#define SAVE_ERROR_CLEAN_UP(tmp, fd, err) {                             \
+  const int _err = (err);                                               \
+  if ((fd) >= 0) close(fd);                                             \
+  unlink(tmp);                                                          \
+  MSG_ERR("failed to save restart file `%s': %s\n",                     \
+      cstat.fname_rst, strerror(_err));                                 \
+  return ERR_FILE;                                                      \
+}
 
+/******************************************************************************
+Function `read_jobs`:
+  Read commands (one per non-empty line) from a job list file.
+Arguments:
+  * `fname`:    path to the job list file.
+Return:
+  Zero on success; non-zero on error.
+******************************************************************************/
 int read_jobs(const char *fname) {
   FILE *fp;
-  char line[CMD_BUF];
-  char *buf;
-  int i, n, maxlen;
-
   if (!(fp = fopen(fname, "r"))) {
     MSG_ERR("cannot open the job list file `%s'.\n", fname);
     return ERR_FILE;
   }
 
   /* count the number and maximum length of commands */
-  n = maxlen = 0;
-  memset(line, 0, CMD_BUF);
-  while (fgets(line, CMD_BUF, fp) != NULL) {
-    sscanf(line, "%*[ |\t]%[^\n]", line);       /* remove leading spaces */
-    if (line[0] != COMMENT && isgraph(line[0])) {
-      buf = memchr(line, '\n', CMD_BUF);
-      if (buf == NULL) {
-        MSG_ERR("command length exceeds CMD_BUF.\n");
+  int n = 0;
+  int maxlen = 1;
+  char *buf, line[CMD_BUF + 2];         /* extra space for CRLF */
+  while (fgets(line, sizeof(line), fp) != NULL) {
+    /* Exclude long lines. */
+    size_t len = strlen(line);
+    if (len && line[len - 1] == '\n') len--;
+    if (len && line[len - 1] == '\r') len--;
+    if (len >= CMD_BUF) {
+      MSG_ERR("command length exceeds %d bytes.\n", CMD_BUF - 1);
+      fclose(fp);
+      return ERR_STRING;
+    }
+    buf = line;
+    while (isspace((unsigned char) *buf)) buf++;
+    if (*buf && *buf != COMMENT) {
+      int len = (int) strlen(buf) + 1;
+      if (maxlen < len) maxlen = len;
+      if (n >= INT_MAX / maxlen) {
+        fclose(fp);
         return ERR_STRING;
       }
-
-      i = buf - line + 1;
-      if (maxlen < i) maxlen = i;
       n++;
     }
-    memset(line, 0, CMD_BUF);
   }
 
+  if (ferror(fp)) {
+    MSG_ERR("failed to read file `%s'.\n", fname);
+    fclose(fp);
+    return ERR_FILE;
+  }
   if (n < 1) {
-    MSG_ERR("job not found.\n");
+    MSG_ERR("no job found in file `%s'.\n", fname);
+    fclose(fp);
     return ERR_FILE;
   }
 
   cstat.num = n;
   cstat.len = maxlen;
   cstat.cmd = calloc((size_t) n * maxlen, sizeof(char));
-  if (!(cstat.cmd)) {
+  if (!cstat.cmd) {
     MSG_ERR("failed to allocate memory for the commands.\n");
+    fclose(fp);
     return ERR_MEMORY;
   }
 
   /* read commands into array */
-  fseek(fp, 0, SEEK_SET);
+  if (fseek(fp, 0, SEEK_SET)) {
+    MSG_ERR("failed to read file `%s'.\n", fname);
+    fclose(fp);
+    return ERR_FILE;
+  }
   n = 0;
-  while (fgets(line, CMD_BUF, fp) != NULL) {
-    sscanf(line, "%*[ |\t]%[^\n]", line);       /* remove leading spaces */
-    if (line[0] != COMMENT && isgraph(line[0])) {
-      line[strcspn(line, "\r\n")] = '\0';
-      buf = cstat.cmd + n * maxlen;
-      strncpy(buf, line, maxlen);
+  while (fgets(line, sizeof(line), fp) != NULL) {
+    buf = line;
+    while (isspace((unsigned char) *buf)) buf++;
+    if (*buf && *buf != COMMENT) {
+      if (n >= cstat.num || strlen(buf) >= (size_t) maxlen) {
+        MSG_ERR("file changed while reading: `%s'.\n", fname);
+        fclose(fp);
+        return ERR_FILE;
+      }
+      buf[strcspn(buf, "\r\n")] = '\0';
+      strncpy(cstat.cmd + (size_t) n * maxlen, buf, maxlen);
       n++;
     }
-    memset(line, 0, CMD_BUF);
+  }
+
+  if (ferror(fp) || n != cstat.num) {
+    MSG_ERR("unexpected error while reading file: `%s'.\n", fname);
+    fclose(fp);
+    return ERR_FILE;
   }
 
   fclose(fp);
@@ -68,34 +107,72 @@ int read_jobs(const char *fname) {
 }
 
 
-void save_jobs(void) {
-  if (term == 1)  return;       /* this function should only run for once */
-  else term = 1;
+/******************************************************************************
+Function `write_all`:
+  Write all requested bytes and retry interrupted writes.
+Arguments:
+  * `fd`:       POSIX-compatible file descriptor;
+  * `buf`:      starting address of contents to be written;
+  * `len`:      number of bytes to be written.
+Return:
+  Zero on success; non-zero on error.
+******************************************************************************/
+static int write_all(const int fd, const char *buf, size_t len) {
+  while (len) {
+    ssize_t n = write(fd, buf, len);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) {
+      if (!n) errno = EIO;
+      return ERR_FILE;
+    }
+    buf += n;
+    len -= n;
+  }
+  return 0;
+}
 
-  int i, cnt, logfile;
-  char *cmd;
 
-  for (cnt = 0, i = 0; i < cstat.num; i++) {
+/******************************************************************************
+Function `save_jobs`:
+  Write unfinished commands to a restart file.
+Return:
+  Zero on success; non-zero on error.
+******************************************************************************/
+int save_jobs(void) {
+  if (!cstat.cmd || !cstat.status) return ERR_FILE;
+  int cnt = 0;
+  for (int i = 0; i < cstat.num; i++) {
     if (cstat.status[i] != JOB_DONE) cnt++;
   }
-  if (cnt == 0) return;         /* no failed job */
+  if (!cnt) return 0;
 
-  if (!(cstat.status && cstat.cmd)) return;
+  /* Write to a temporary file, and then rename it to the restart file. */
+  char tmp[CMD_BUF + 8];
+  snprintf(tmp, sizeof(tmp), "%s.XXXXXX", cstat.fname_rst);
+  int fd = mkstemp(tmp);
+  if (fd < 0) {
+    MSG_ERR("failed to save restart file `%s': %s\n",
+        cstat.fname_rst, strerror(errno));
+    return ERR_FILE;
+  }
 
-  logfile = open(cstat.fname_rst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  write(logfile, "# Unfinished jobs\n", 18);
+  const char header[] = "# Unfinished jobs\n";
+  if (write_all(fd, header, sizeof(header) - 1))
+    SAVE_ERROR_CLEAN_UP(tmp, fd, errno);
 
-  for (i = 0; i < cstat.num; i++) {
+  for (int i = 0; i < cstat.num; i++) {
     if (cstat.status[i] != JOB_DONE) {
-      cmd = cstat.cmd + i * cstat.len;
-      write(logfile, cmd, strlen(cmd));
-      write(logfile, "\n", 1);
+      const char *cmd = cstat.cmd + (size_t) i * cstat.len;
+      if (write_all(fd, cmd, strlen(cmd)) || write_all(fd, "\n", 1))
+        SAVE_ERROR_CLEAN_UP(tmp, fd, errno);
     }
   }
 
-  write(STDOUT_FILENO, "Restart file created:\n  ", 24);
-  write(STDOUT_FILENO, cstat.fname_rst, strlen(cstat.fname_rst));
-  write(STDOUT_FILENO, "\n", 1);
-  close(logfile);
-}
+  if (close(fd) || rename(tmp, cstat.fname_rst))
+    SAVE_ERROR_CLEAN_UP(tmp, -1, errno);
 
+  printf("Restart file saved (%d unfinished jobs):\n  %s\n",
+      cnt, cstat.fname_rst);
+  fflush(stdout);
+  return 0;
+}

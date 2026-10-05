@@ -1,7 +1,8 @@
 CC = gcc 
 MPICC = mpicc
 CFLAGS = -O3 -Wall -std=c99 -D_POSIX_C_SOURCE=200809L
-LIBS = -fopenmp
+LIBS =
+LIBS_OMP = -fopenmp
 INCL =
 OPTS = $(INCL) $(LIBS)
 SRCS_OMP = jobfork.c cmdlist.c subprocess.c
@@ -12,7 +13,7 @@ EXEC_MPI = jobfork_mpi
 all: omp mpi
 
 omp:
-	$(CC) $(CFLAGS) -o $(EXEC_OMP) $(SRCS_OMP) $(OPTS) -DCMD_OMP
+	$(CC) $(CFLAGS) -o $(EXEC_OMP) $(SRCS_OMP) $(OPTS) $(LIBS_OMP) -DCMD_OMP
 
 mpi:
 	$(MPICC) $(CFLAGS) -o $(EXEC_MPI) $(SRCS_MPI) $(OPTS) -DCMD_MPI
