@@ -33,13 +33,15 @@ int create_child(const char *cmd, CHILD_INFO *ci) {
     return ERR_PIPE;
   }
 
-  if (fcntl(pipe_stdout[PIPE_READ], F_SETFL, O_NONBLOCK) ||
-      fcntl(pipe_stderr[PIPE_READ], F_SETFL, O_NONBLOCK)) {
+  if (fcntl(pipe_stdout[PIPE_READ], F_SETFL, O_NONBLOCK) == -1 ||
+      fcntl(pipe_stderr[PIPE_READ], F_SETFL, O_NONBLOCK) == -1 ||
+      fcntl(pipe_stdout[PIPE_READ], F_SETFD, FD_CLOEXEC) == -1 ||
+      fcntl(pipe_stderr[PIPE_READ], F_SETFD, FD_CLOEXEC) == -1) {
     close(pipe_stdout[PIPE_READ]);
     close(pipe_stdout[PIPE_WRITE]);
     close(pipe_stderr[PIPE_READ]);
     close(pipe_stderr[PIPE_WRITE]);
-    MSG_ERR("failed to set nonblocking child output on job:\n   %s\n", cmd);
+    MSG_ERR("failed to set child output pipe on job:\n   %s\n", cmd);
     return ERR_PIPE;
   }
 
@@ -135,9 +137,20 @@ Return:
   JOB_START if job is running; JOB_DONE on success; JOB_FAIL on error.
 ******************************************************************************/
 int close_child(CHILD_INFO *ci, const int task, const int idx, const int stop) {
-  if (stop && !ci->stopped) {
-    ci->stopped = ci->failed = 1;
-    if (kill(-ci->pid, SIGKILL) && errno == ESRCH) kill(ci->pid, SIGKILL);
+  siginfo_t info = {0};
+  int waiterr = 0;
+  if (!ci->stopped) {
+    /* Check for failure even if children still hold the output pipes. */
+    if (!stop && waitid(P_PID, ci->pid, &info, WEXITED | WNOHANG | WNOWAIT)) {
+      waiterr = errno;
+      info.si_pid = 0;
+    }
+    /* Stop the whole group on cancellation or an unsuccessful shell exit. */
+    if (stop || (info.si_pid &&
+        (info.si_code != CLD_EXITED || info.si_status))) {
+      ci->stopped = ci->failed = 1;
+      if (kill(-ci->pid, SIGKILL) && errno == ESRCH) kill(ci->pid, SIGKILL);
+    }
   }
 
   char buf[CMD_BUF];
@@ -164,11 +177,13 @@ int close_child(CHILD_INFO *ci, const int task, const int idx, const int stop) {
   }
 
   if (ci->fd[0] >= 0 || ci->fd[1] >= 0) return JOB_START;
+  if (!ci->stopped && !info.si_pid && (!waiterr || waiterr == EINTR))
+    return JOB_START;
 
   /* Close the child only after stdout and stderr are closed. */
   int status;
-  pid_t pid = waitpid(ci->pid, &status, WNOHANG);
-  if (!pid || (pid < 0 && errno == EINTR)) return JOB_START;
+  pid_t pid = waiterr ? -1 : waitpid(ci->pid, &status, WNOHANG);
+  if (!pid || (!waiterr && pid < 0 && errno == EINTR)) return JOB_START;
   if (pid < 0 || ci->failed || !WIFEXITED(status) || WEXITSTATUS(status)) {
     MSG_ERR("unable to finish command on task %d (job index: %d).\n",
         task, idx);
