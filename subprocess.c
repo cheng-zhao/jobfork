@@ -184,9 +184,25 @@ int close_child(CHILD_INFO *ci, const int task, const int idx, const int stop) {
   int status;
   pid_t pid = waiterr ? -1 : waitpid(ci->pid, &status, WNOHANG);
   if (!pid || (!waiterr && pid < 0 && errno == EINTR)) return JOB_START;
+
   if (pid < 0 || ci->failed || !WIFEXITED(status) || WEXITSTATUS(status)) {
-    MSG_ERR("unable to finish command on task %d (job index: %d).\n",
-        task, idx);
+    if (pid < 0) {
+      MSG_ERR("waitpid error of job index %d on task %d: %s.\n", idx, task,
+          strerror(waiterr ? waiterr : errno));
+    }
+    else if (WIFEXITED(status)) {
+      MSG_ERR("exit code of job index %d on task %d: %d%s.\n", idx, task,
+          WEXITSTATUS(status), ci->failed && !WEXITSTATUS(status) ?
+          " (internal stop or I/O failure)" : "");
+    }
+    else if (WIFSIGNALED(status)) {
+      MSG_ERR("termination signal of job index %d on task %d: %d.\n",
+          idx, task, WTERMSIG(status));
+    }
+    else {
+      MSG_ERR("unexpected wait status of job index %d on task %d: %d.\n",
+          idx, task, status);
+    }
     return JOB_FAIL;
   }
 
