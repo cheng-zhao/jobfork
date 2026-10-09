@@ -1,6 +1,7 @@
 #include "jobfork.h"
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <spawn.h>
 
 #define PIPE_READ 0
 #define PIPE_WRITE 1
@@ -45,46 +46,53 @@ int create_child(const char *cmd, CHILD_INFO *ci) {
     return ERR_PIPE;
   }
 
-  pid_t pid = fork();
-  if (pid < 0) {
+  posix_spawnattr_t attr;
+  posix_spawn_file_actions_t actions;
+  int attr_err = posix_spawnattr_init(&attr);
+  int actions_err = posix_spawn_file_actions_init(&actions);
+  int err = attr_err ? attr_err : actions_err;
+
+  /* Restore default stop signals and unblock signals in the command. */
+  sigset_t mask, defaults;
+  if (!err && (sigemptyset(&mask) || sigemptyset(&defaults) ||
+      sigaddset(&defaults, SIGHUP) || sigaddset(&defaults, SIGINT) ||
+      sigaddset(&defaults, SIGTERM) || sigaddset(&defaults, SIGQUIT))) {
+    err = errno;
+  }
+  if (!err) err = posix_spawnattr_setsigmask(&attr, &mask);
+  if (!err) err = posix_spawnattr_setsigdefault(&attr, &defaults);
+
+  /* A zero group ID creates a group led by the child for group cleanup. */
+  if (!err) err = posix_spawnattr_setpgroup(&attr, 0);
+  if (!err) err = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK |
+      POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETPGROUP);
+
+  /* Redirect the two output streams, then close the original pipe ends. */
+  if (!err) err = posix_spawn_file_actions_adddup2(&actions,
+      pipe_stdout[PIPE_WRITE], STDOUT_FILENO);
+  if (!err) err = posix_spawn_file_actions_adddup2(&actions,
+      pipe_stderr[PIPE_WRITE], STDERR_FILENO);
+  for (int i = 0; i < 2 && !err; i++) {
+    err = posix_spawn_file_actions_addclose(&actions, pipe_stdout[i]);
+    if (!err) err = posix_spawn_file_actions_addclose(&actions, pipe_stderr[i]);
+  }
+
+  pid_t pid;
+  if (!err) err = posix_spawn(&pid, JOBFORK_SHELL, &actions, &attr,
+      argp, environ);
+  if (!actions_err) posix_spawn_file_actions_destroy(&actions);
+  if (!attr_err) posix_spawnattr_destroy(&attr);
+
+  if (err) {
     close(pipe_stdout[PIPE_READ]);
     close(pipe_stdout[PIPE_WRITE]);
     close(pipe_stderr[PIPE_READ]);
     close(pipe_stderr[PIPE_WRITE]);
-    MSG_ERR("failed to create a new process for job:\n"
-        "    %s\n", cmd);
+    MSG_ERR("failed to spawn a process (%s) for job:\n    %s\n",
+        strerror(err), cmd);
     return ERR_FORK;
   }
-  else if (pid == 0) {          /* child process */
-    /* Restore default stop-signal handling and create a process group. */
-    struct sigaction sa = {0};
-    sa.sa_handler = SIG_DFL;
-    if (sigemptyset(&sa.sa_mask) ||
-        sigaction(SIGHUP, &sa, NULL) || sigaction(SIGINT, &sa, NULL) ||
-        sigaction(SIGTERM, &sa, NULL) || sigaction(SIGQUIT, &sa, NULL)) {
-      _exit(ERR_SIG);
-    }
-    setpgid(0, 0);
-    if (sigprocmask(SIG_SETMASK, &sa.sa_mask, NULL)) _exit(ERR_SIG);
 
-    if (dup2(pipe_stdout[PIPE_WRITE], STDOUT_FILENO) == -1 ||
-        dup2(pipe_stderr[PIPE_WRITE], STDERR_FILENO) == -1) _exit(ERR_REDIR);
-
-    close(pipe_stdout[PIPE_READ]);
-    close(pipe_stdout[PIPE_WRITE]);
-    close(pipe_stderr[PIPE_READ]);
-    close(pipe_stderr[PIPE_WRITE]);
-
-    /* Group for the command and its descendants to be stopped together. */
-    execve(JOBFORK_SHELL, argp, environ);
-    _exit(ERR_EXEC);
-  }
-
-  /* Also set the process group from the parent to avoid fork/exec race. */
-  if (setpgid(pid, pid) && errno != EACCES && errno != ESRCH) {
-    MSG_ERR("failed to set process group for child %ld: %s\n",
-        (long) pid, strerror(errno));
-  }
   close(pipe_stdout[PIPE_WRITE]);
   close(pipe_stderr[PIPE_WRITE]);
 
